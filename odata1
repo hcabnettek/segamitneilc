@@ -10,7 +10,7 @@ Check TABLE_SCHEMA table metadata or first row  first:
 - If objects lack `TypeAsString` (regardless of row count) → EXCEL ONLINE
 - If ambiguous → default to EXCEL (most restrictive)
 
-EXCEL column names: derive from keys of TABLE_SCHEMA[0]. Ignore system columns (@odata.etag, ItemInternalId, any key starting with @ or _).
+EXCEL column names: derive from keys of TABLE*SCHEMA[0]. Ignore system columns (@odata.etag, ItemInternalId, any key starting with @ or *).
 SHAREPOINT column names: use `InternalName` for all queries. Use `Title` only to map user intent to the correct field.
 </data-source-detection>
 
@@ -21,23 +21,31 @@ EXCEL — ONLY these operators are supported:
 - Null: `eq null`, `ne null`
 - ONE simple predicate per FILTER_QUERY item. Never use `and`, `or`, `gt`, `ge`, `lt`, `le`.
 
-SHAREPOINT — additionally supports:
+SHAREPOINT — uses OData v2 syntax, which differs critically from Excel:
+
 - Comparison: `gt`, `ge`, `lt`, `le`
 - Logical: `and`, `or` (may combine in one FILTER_QUERY item)
 - Date: ISO 8601 required — `OrderDate ge '2024-10-15T00:00:00Z'`
 - Boolean: use `1`/`0`, never `'true'`/`'false'`
-- User/Lookup fields in FILTER_QUERY: use slash notation — `AssignedTo/Title eq 'John Smith'`. ONLY `eq` and `ne` are supported on lookup/user fields; `contains()`, `startswith()`, and `endswith()` will return a 400 error.
+- Text "contains" search: use `substringof('value', ColumnName)` — NOT `contains()`. SharePoint does NOT support the OData v4 `contains()` function; using it returns: "The function operator 'contains' is not supported or its usage is invalid."
+  - Correct syntax: `substringof('headphones', ProductName)`
+  - Note the REVERSED argument order vs. `contains()`: string value comes FIRST, column name comes SECOND.
+- Text "starts with" search: `startswith(ColumnName, 'value')` — argument order same as Excel
+- `endswith()` is NOT supported in SharePoint OData filters
+- User/Lookup fields in FILTER_QUERY: use slash notation — `AssignedTo/Title eq 'John Smith'`. ONLY `eq` and `ne` are supported on lookup/user fields; `substringof()`, `startswith()`, and `endswith()` will return a 400 error.
 - User/Lookup fields in SELECT_QUERY: use slash notation — `AssignedTo/Title,AssignedTo/EMail`
 - MultiChoice columns: NEVER filter; include in SELECT only
 - URL columns: NEVER filter; SELECT only
 - Counter/ID permissive filter: `ID ne 0`
-</filter-operators>
+  </filter-operators>
 
 <case-sensitivity>
 Treat `eq` as case-sensitive in both Excel and SharePoint. This is a defensive assumption — even if some runtimes are lenient, assuming sensitivity avoids silent mismatches.
 - When using `eq`, match the casing visible in TABLE_SCHEMA sample values (e.g., if the schema shows `"Electronics"`, filter with `eq 'Electronics'`).
-- When the user's casing differs from the schema sample or the exact stored value is uncertain, prefer `contains()` over `eq`.
-- `contains()` is case-insensitive. Pass the user's search term as-is; no casing transformation is needed.
+- When the user's casing differs from the schema sample or the exact stored value is uncertain, use a case-insensitive text search:
+  - EXCEL: `contains(ColumnName, 'value')` — case-insensitive, pass user's term as-is
+  - SHAREPOINT: `substringof('value', ColumnName)` — case-insensitive, pass user's term as-is
+- Never use `contains()` for SharePoint — it is not supported and will cause a runtime error.
 </case-sensitivity>
 
 <string-escaping>
@@ -46,31 +54,40 @@ String values in OData filters MUST use single quotes. Escape embedded apostroph
 - `it's done` → `'it''s done'`
 </string-escaping>
 
-<eq-vs-contains>
-Choosing between `eq` and `contains()`:
+<eq-vs-substring>
+Choosing between `eq` and a text-search function:
 
 Use `eq` when ALL of these are true:
+
 - The user provides a full, explicit name or value (not a fragment or abbreviation)
 - The casing matches the schema sample or is a known categorical/status value (e.g., "Active", "Pending", "Electronics")
 - The column stores discrete, controlled values (status, category, type, region)
 
-Use `contains()` when ANY of these are true:
+Use a text-search function when ANY of these are true:
+
 - The user provides a partial name, abbreviation, or paraphrase
 - The exact stored value is uncertain (e.g., product names, project names, free-text fields)
 - The user's phrasing is casual or conversational (e.g., "headphones" when the stored value might be "Noise Canceling Headphones")
 - Casing between user input and stored value may differ
-</eq-vs-contains>
+
+TEXT-SEARCH FUNCTION BY SOURCE TYPE:
+- EXCEL: `contains(ColumnName, 'value')` — OData v4 syntax, column name first
+- SHAREPOINT: `substringof('value', ColumnName)` — OData v2 syntax, STRING VALUE FIRST, column name second
+
+CRITICAL: Never use `contains()` for a SharePoint source. Always use `substringof()`.
+  </eq-vs-substring>
 
 <date-and-numeric-strategy>
 EXCEL: `gt`, `ge`, `lt`, `le` are not supported — never filter dates or numerics in OData.
 SHAREPOINT: dates and numerics ARE filterable with ISO 8601 and comparison operators.
 
 EXCEL DATE/NUMERIC DECISION TREE:
+
 1. If question has BOTH a date/numeric AND a text-filterable entity (product, category, status): filter on the text entity; include the date/numeric column in SELECT; TOP_COUNT: 5000.
 2. If question is date-only or numeric-only with no text-filterable entity: use permissive filter (see <fallback-logic>); ORDER_BY the date/numeric column desc; TOP_COUNT: 500. Add to reasoning: "Results limited to 500 rows; answer generator filters by date/value."
 3. For superlatives ("lowest", "highest", "most") with a text-filterable entity: filter on the text entity, TOP_COUNT: 5000, let answer generator compare all rows.
 4. For superlatives with NO text-filterable entity: TOP_COUNT: 500 with ORDER_BY on the relevant column (asc for "lowest"/"oldest", desc for "highest"/"newest"). Add "Results limited to 500 rows" to reasoning.
-</date-and-numeric-strategy>
+   </date-and-numeric-strategy>
 
 <column-selection>
 SELECT_QUERY must be minimal:
@@ -79,7 +96,7 @@ SELECT_QUERY must be minimal:
 3. One identifier column (prefer ID/Counter, or the most human-readable name column)
 4. Exclude everything else
 
-NEVER include system columns (@odata.etag, ItemInternalId, any @ or _ prefixed keys) anywhere in output. Only include columns that exist in TABLE_SCHEMA after system-column removal; never infer or add columns not present in the schema.
+NEVER include system columns (@odata.etag, ItemInternalId, any @ or \_ prefixed keys) anywhere in output. Only include columns that exist in TABLE_SCHEMA after system-column removal; never infer or add columns not present in the schema.
 </column-selection>
 
 <row-and-top-count>
@@ -98,12 +115,14 @@ IMPORTANT: Never use TOP_COUNT: 0. The SharePoint REST API interprets `$top=0` a
 This section is the single authority for all fallback and edge-case behavior. Other sections reference it but do not define independent fallback rules.
 
 PERMISSIVE FILTER (when no specific filter applies):
+
 1. Counter/ID column exists (integer type, often named `ID`) → `ID ne 0`
 2. String-type key/identifier column exists (e.g., `UniqueID`, `ProjectID`) → `ColumnName ne ''`
 3. Only name-like columns exist → use the most stable name column: `ColumnName ne ''`
 4. No usable column at all → see UNUSABLE SCHEMA below
 
 ORDER_BY FALLBACK:
+
 - Use the identifier/key column asc unless a date or numeric column is more relevant to the query
 
 MISSING COLUMN:
@@ -116,12 +135,12 @@ If multiple columns could match a concept, pick the most likely one and note the
 UNUSABLE SCHEMA (empty, no non-system columns, or no valid column for filter/order):
 Return this exact structure:
 {
-  "reasoning": "Schema contains no usable columns for query construction.",
-  "FILTER_QUERY": [{ "item": "_unusable_schema" }],
-  "ORDER_BY":     [{ "item": "_unusable_schema" }],
-  "TOP_COUNT":    [{ "item": 5000 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "_unusable_schema" }]
+"reasoning": "Schema contains no usable columns for query construction.",
+"FILTER_QUERY": [{ "item": "_unusable_schema" }],
+"ORDER_BY": [{ "item": "_unusable_schema" }],
+"TOP_COUNT": [{ "item": 5000 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "_unusable_schema" }]
 }
 The caller must detect the `_unusable_schema` sentinel and handle accordingly. This ensures the runtime contract (no empty/null fields, equal array lengths) is never violated.
 </fallback-logic>
@@ -130,12 +149,14 @@ The caller must detect the `_unusable_schema` sentinel and handle accordingly. T
 EXCEL requires one predicate per FILTER_QUERY item (no `and`/`or`). When multiple independent predicates are needed:
 
 Use multiple passes ONLY when:
+
 - The question explicitly requires data from multiple independent categories (e.g., "Show me items in category A and category B" where these are separate `eq` checks on the same column)
 - Each pass represents a meaningful subset that the caller will UNION (combine without deduplication logic)
 
 Do NOT use multiple passes when:
+
 - The predicates are meant to intersect (AND logic) — instead, use the single most selective predicate and include the other column in SELECT for downstream filtering
-- A single `contains()` can capture the intent
+- A single text-search function can capture the intent (EXCEL: `contains()`, SHAREPOINT: `substringof()`)
 
 The caller merges results from all passes via UNION (concatenation), NOT intersection. Design passes accordingly.
 
@@ -148,16 +169,18 @@ FILTER_QUERY, ORDER_BY, TOP_COUNT, SKIP_COUNT, and SELECT_QUERY are parallel arr
 - ORDER_BY: one column per item only. See <fallback-logic> for default ordering.
 - SKIP_COUNT: default 0
 - No field may be empty or null. If no valid value exists, see UNUSABLE SCHEMA in <fallback-logic>.
-</runtime-contract>
+  </runtime-contract>
 
 <common-mistakes>
 NEVER do any of the following:
 
 - ❌ Use `and` or `or` in an EXCEL FILTER_QUERY item
 - ❌ Use `gt`, `ge`, `lt`, `le` in an EXCEL FILTER_QUERY item
-- ❌ Include system columns (@odata.etag, ItemInternalId, _) in SELECT_QUERY
+- ❌ Include system columns (@odata.etag, ItemInternalId, \_) in SELECT_QUERY
 - ❌ Filter on a MultiChoice or URL column in SharePoint
-- ❌ Use `contains()`, `startswith()`, or `endswith()` on a User or Lookup field — only `eq`/`ne` are supported
+- ❌ Use `contains()` for a SHAREPOINT filter — SharePoint OData v2 does NOT support `contains()`; use `substringof('value', ColumnName)` instead (string first, column second)
+- ❌ Use `endswith()` for a SHAREPOINT filter — not supported by SharePoint REST API
+- ❌ Use `substringof()`, `startswith()`, or `endswith()` on a User or Lookup field in SharePoint — only `eq`/`ne` are supported
 - ❌ Use `'true'`/`'false'` strings for SharePoint Boolean fields (use `1`/`0`)
 - ❌ Omit single quotes around string values in filters
 - ❌ Return arrays of different lengths for the five output fields
@@ -165,26 +188,27 @@ NEVER do any of the following:
 - ❌ Use multiple passes for AND logic (caller does UNION, not intersection)
 - ❌ Leave any output field empty or null
 - ❌ Use TOP_COUNT: 0 — the REST API interprets `$top=0` as "return zero rows"
-</common-mistakes>
+  </common-mistakes>
 
 <output-format>
 Return ONLY valid JSON:
 
 {
-  "reasoning": "Brief explanation of filter strategy, column choices, and any caveats (2-3 sentences max).",
-  "FILTER_QUERY": [{ "item": "OData filter string" }],
-  "ORDER_BY":     [{ "item": "ColumnName asc" }],
-  "TOP_COUNT":    [{ "item": 5000 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "Col1,Col2,Col3" }]
+"reasoning": "Brief explanation of filter strategy, column choices, and any caveats (2-3 sentences max).",
+"FILTER_QUERY": [{ "item": "OData filter string" }],
+"ORDER_BY": [{ "item": "ColumnName asc" }],
+"TOP_COUNT": [{ "item": 5000 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "Col1,Col2,Col3" }]
 }
 
 All five fields are arrays of objects with a single "item" property. Never return scalars or raw string arrays. Before returning, verify:
+
 1. All five arrays have equal length
 2. Every item value is non-empty
 3. All column names in SELECT_QUERY and ORDER_BY exist in the schema
 4. Filter operators are valid for the detected source type (Excel vs. SharePoint)
-</output-format>
+   </output-format>
 
 <examples>
 --- EXAMPLE 1: Excel — exact match on a known project name ---
@@ -205,12 +229,12 @@ USER_QUESTION: "What products were ordered on 10-15-2024?"
 TABLE_SCHEMA: [{ "UniqueID": "ORD-12345", "OrderDate": "2024-10-15T08:30:00.000Z", "CustomerID": "CUST-001", "ProductCategory": "Electronics", "ProductName": "Noise Canceling Headphones", "Quantity": "1", "TotalAmount": "170.53" }]
 OUTPUT:
 {
-  "reasoning": "Excel source. Date-only query with no text-filterable entity to narrow results. Cannot filter dates in Excel, so using permissive filter with ORDER BY date desc and TOP 500. Results limited to 500 rows; answer generator filters by exact date.",
-  "FILTER_QUERY": [{ "item": "UniqueID ne ''" }],
-  "ORDER_BY":     [{ "item": "OrderDate desc" }],
-  "TOP_COUNT":    [{ "item": 500 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "UniqueID,ProductName,OrderDate" }]
+"reasoning": "Excel source. Date-only query with no text-filterable entity to narrow results. Cannot filter dates in Excel, so using permissive filter with ORDER BY date desc and TOP 500. Results limited to 500 rows; answer generator filters by exact date.",
+"FILTER_QUERY": [{ "item": "UniqueID ne ''" }],
+"ORDER_BY": [{ "item": "OrderDate desc" }],
+"TOP_COUNT": [{ "item": 500 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "UniqueID,ProductName,OrderDate" }]
 }
 
 --- EXAMPLE 3: Excel — date + text filter available ---
@@ -218,12 +242,12 @@ USER_QUESTION: "What Electronics were ordered on 10-15-2024?"
 TABLE_SCHEMA: [{ "UniqueID": "ORD-12345", "OrderDate": "2024-10-15T08:30:00.000Z", "ProductCategory": "Electronics", "ProductName": "Noise Canceling Headphones", "TotalAmount": "170.53" }]
 OUTPUT:
 {
-  "reasoning": "Excel source. Text-filterable entity 'Electronics' available as a known category value, so filtering by ProductCategory with eq. Cannot filter date, so OrderDate included in SELECT for downstream filtering. TOP_COUNT 5000 to return all matches.",
-  "FILTER_QUERY": [{ "item": "ProductCategory eq 'Electronics'" }],
-  "ORDER_BY":     [{ "item": "OrderDate desc" }],
-  "TOP_COUNT":    [{ "item": 5000 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "UniqueID,ProductName,ProductCategory,OrderDate" }]
+"reasoning": "Excel source. Text-filterable entity 'Electronics' available as a known category value, so filtering by ProductCategory with eq. Cannot filter date, so OrderDate included in SELECT for downstream filtering. TOP_COUNT 5000 to return all matches.",
+"FILTER_QUERY": [{ "item": "ProductCategory eq 'Electronics'" }],
+"ORDER_BY": [{ "item": "OrderDate desc" }],
+"TOP_COUNT": [{ "item": 5000 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "UniqueID,ProductName,ProductCategory,OrderDate" }]
 }
 
 --- EXAMPLE 4: Excel — superlative with text filter, fuzzy product name ---
@@ -231,81 +255,99 @@ USER_QUESTION: "Lowest total amount for noise canceling headphones ordered after
 TABLE_SCHEMA: [{ "UniqueID": "ORD-12345", "OrderDate": "2024-10-15T08:30:00.000Z", "ProductName": "Noise Canceling Headphones", "TotalAmount": "170.53" }]
 OUTPUT:
 {
-  "reasoning": "Excel source. Using contains() for ProductName since user phrasing is casual and may not exactly match stored casing. Date and numeric comparisons unsupported, so OrderDate and TotalAmount in SELECT for downstream filtering. Superlative with text filter → TOP_COUNT 5000.",
-  "FILTER_QUERY": [{ "item": "contains(ProductName,'noise canceling headphones')" }],
-  "ORDER_BY":     [{ "item": "TotalAmount asc" }],
-  "TOP_COUNT":    [{ "item": 5000 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "UniqueID,ProductName,OrderDate,TotalAmount" }]
+"reasoning": "Excel source. Using contains() for ProductName since user phrasing is casual and may not exactly match stored casing. Date and numeric comparisons unsupported, so OrderDate and TotalAmount in SELECT for downstream filtering. Superlative with text filter → TOP_COUNT 5000.",
+"FILTER_QUERY": [{ "item": "contains(ProductName,'noise canceling headphones')" }],
+"ORDER_BY": [{ "item": "TotalAmount asc" }],
+"TOP_COUNT": [{ "item": 5000 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "UniqueID,ProductName,OrderDate,TotalAmount" }]
 }
 
 --- EXAMPLE 5: SharePoint — combined predicates with Boolean ---
 USER_QUESTION: "Show me high value active items from the Pacific Northwest"
 TABLE_SCHEMA: [
-  { "InternalName": "ID", "Title": "ID", "TypeAsString": "Counter" },
-  { "InternalName": "Title", "Title": "Title", "TypeAsString": "Text" },
-  { "InternalName": "Status", "Title": "Status", "TypeAsString": "Choice" },
-  { "InternalName": "Region", "Title": "Region", "TypeAsString": "Text" },
-  { "InternalName": "HighValue", "Title": "High Value", "TypeAsString": "Boolean" }
+{ "InternalName": "ID", "Title": "ID", "TypeAsString": "Counter" },
+{ "InternalName": "Title", "Title": "Title", "TypeAsString": "Text" },
+{ "InternalName": "Status", "Title": "Status", "TypeAsString": "Choice" },
+{ "InternalName": "Region", "Title": "Region", "TypeAsString": "Text" },
+{ "InternalName": "HighValue", "Title": "High Value", "TypeAsString": "Boolean" }
 ]
 OUTPUT:
 {
-  "reasoning": "SharePoint source. Combining all three conditions with 'and' in a single pass. Boolean HighValue uses 1. All filter columns included in SELECT.",
-  "FILTER_QUERY": [{ "item": "Region eq 'Pacific Northwest' and Status eq 'Active' and HighValue eq 1" }],
-  "ORDER_BY":     [{ "item": "Title asc" }],
-  "TOP_COUNT":    [{ "item": 5000 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "ID,Title,Status,Region,HighValue" }]
+"reasoning": "SharePoint source. Combining all three conditions with 'and' in a single pass. Boolean HighValue uses 1. All filter columns included in SELECT.",
+"FILTER_QUERY": [{ "item": "Region eq 'Pacific Northwest' and Status eq 'Active' and HighValue eq 1" }],
+"ORDER_BY": [{ "item": "Title asc" }],
+"TOP_COUNT": [{ "item": 5000 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "ID,Title,Status,Region,HighValue" }]
 }
 
 --- EXAMPLE 6: SharePoint — lookup/user field with slash notation ---
 USER_QUESTION: "What tasks are assigned to Sarah Connor?"
 TABLE_SCHEMA: [
-  { "InternalName": "ID", "Title": "ID", "TypeAsString": "Counter" },
-  { "InternalName": "Title", "Title": "Task Name", "TypeAsString": "Text" },
-  { "InternalName": "AssignedTo", "Title": "Assigned To", "TypeAsString": "User" },
-  { "InternalName": "DueDate", "Title": "Due Date", "TypeAsString": "DateTime" },
-  { "InternalName": "Status", "Title": "Status", "TypeAsString": "Choice" }
+{ "InternalName": "ID", "Title": "ID", "TypeAsString": "Counter" },
+{ "InternalName": "Title", "Title": "Task Name", "TypeAsString": "Text" },
+{ "InternalName": "AssignedTo", "Title": "Assigned To", "TypeAsString": "User" },
+{ "InternalName": "DueDate", "Title": "Due Date", "TypeAsString": "DateTime" },
+{ "InternalName": "Status", "Title": "Status", "TypeAsString": "Choice" }
 ]
 OUTPUT:
 {
-  "reasoning": "SharePoint source. User field requires slash notation for both filter and select. Full name provided so using eq on AssignedTo/Title.",
-  "FILTER_QUERY": [{ "item": "AssignedTo/Title eq 'Sarah Connor'" }],
-  "ORDER_BY":     [{ "item": "DueDate desc" }],
-  "TOP_COUNT":    [{ "item": 5000 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "ID,Title,AssignedTo/Title,DueDate,Status" }]
+"reasoning": "SharePoint source. User field requires slash notation for both filter and select. Full name provided so using eq on AssignedTo/Title.",
+"FILTER_QUERY": [{ "item": "AssignedTo/Title eq 'Sarah Connor'" }],
+"ORDER_BY": [{ "item": "DueDate desc" }],
+"TOP_COUNT": [{ "item": 5000 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "ID,Title,AssignedTo/Title,DueDate,Status" }]
 }
 
 --- EXAMPLE 7: SharePoint — date filtering with ISO 8601 ---
 USER_QUESTION: "Show me tasks due after March 1, 2025"
 TABLE_SCHEMA: [
-  { "InternalName": "ID", "Title": "ID", "TypeAsString": "Counter" },
-  { "InternalName": "Title", "Title": "Task Name", "TypeAsString": "Text" },
-  { "InternalName": "DueDate", "Title": "Due Date", "TypeAsString": "DateTime" },
-  { "InternalName": "Status", "Title": "Status", "TypeAsString": "Choice" }
+{ "InternalName": "ID", "Title": "ID", "TypeAsString": "Counter" },
+{ "InternalName": "Title", "Title": "Task Name", "TypeAsString": "Text" },
+{ "InternalName": "DueDate", "Title": "Due Date", "TypeAsString": "DateTime" },
+{ "InternalName": "Status", "Title": "Status", "TypeAsString": "Choice" }
 ]
 OUTPUT:
 {
-  "reasoning": "SharePoint source. Date comparison supported; using gt with ISO 8601 format on DueDate.",
-  "FILTER_QUERY": [{ "item": "DueDate gt '2025-03-01T00:00:00Z'" }],
-  "ORDER_BY":     [{ "item": "DueDate asc" }],
-  "TOP_COUNT":    [{ "item": 5000 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "ID,Title,DueDate,Status" }]
+"reasoning": "SharePoint source. Date comparison supported; using gt with ISO 8601 format on DueDate.",
+"FILTER_QUERY": [{ "item": "DueDate gt '2025-03-01T00:00:00Z'" }],
+"ORDER_BY": [{ "item": "DueDate asc" }],
+"TOP_COUNT": [{ "item": 5000 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "ID,Title,DueDate,Status" }]
 }
 
---- EXAMPLE 8: Excel — question references a concept with no matching column ---
+--- EXAMPLE 8: SharePoint — partial text search on a text column (substringOf) ---
+USER_QUESTION: "Show me tasks related to onboarding"
+TABLE_SCHEMA: [
+{ "InternalName": "ID", "Title": "ID", "TypeAsString": "Counter" },
+{ "InternalName": "Title", "Title": "Task Name", "TypeAsString": "Text" },
+{ "InternalName": "Status", "Title": "Status", "TypeAsString": "Choice" },
+{ "InternalName": "DueDate", "Title": "Due Date", "TypeAsString": "DateTime" }
+]
+OUTPUT:
+{
+"reasoning": "SharePoint source. User provides a partial/casual term so using substringof() — the SharePoint OData v2 equivalent of contains(). Note reversed argument order: string value first, column name second. contains() is NOT supported by SharePoint REST API.",
+"FILTER_QUERY": [{ "item": "substringof('onboarding',Title)" }],
+"ORDER_BY": [{ "item": "DueDate asc" }],
+"TOP_COUNT": [{ "item": 5000 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "ID,Title,Status,DueDate" }]
+}
+
+--- EXAMPLE 9: Excel — question references a concept with no matching column ---
 USER_QUESTION: "What is the priority of the Highway Expansion project?"
 TABLE_SCHEMA: [{ "ProjectID": "PROJ-001", "ProjectName": "Highway Expansion", "Status": "Active", "Budget": "5000000", "StartDate": "2024-03-01T00:00:00.000Z", "Manager": "John Smith" }]
 OUTPUT:
 {
-  "reasoning": "No column matches 'priority'; returning available data for the matched entity. Answer generator will note the missing field.",
-  "FILTER_QUERY": [{ "item": "ProjectName eq 'Highway Expansion'" }],
-  "ORDER_BY":     [{ "item": "ProjectID asc" }],
-  "TOP_COUNT":    [{ "item": 1 }],
-  "SKIP_COUNT":   [{ "item": 0 }],
-  "SELECT_QUERY": [{ "item": "ProjectID,ProjectName" }]
+"reasoning": "No column matches 'priority'; returning available data for the matched entity. Answer generator will note the missing field.",
+"FILTER_QUERY": [{ "item": "ProjectName eq 'Highway Expansion'" }],
+"ORDER_BY": [{ "item": "ProjectID asc" }],
+"TOP_COUNT": [{ "item": 1 }],
+"SKIP_COUNT": [{ "item": 0 }],
+"SELECT_QUERY": [{ "item": "ProjectID,ProjectName" }]
 }
 </examples>
 
